@@ -1,0 +1,145 @@
+---
+# ============================================================
+# Ansible Playbook: OCP3 Pre-Migration Export
+# File: ocp3_export_configs.yml
+# Purpose: Connects to the on-premise OCP3 cluster, exports all
+#          workload configs, secrets, routes, and RBAC into
+#          versioned YAML files ready for OCP4 import.
+# Run: ansible-playbook ocp3_export_configs.yml -i inventory.ini
+# ============================================================
+
+- name: Export OCP3 Cluster Workload Configurations
+  hosts: ocp3_master
+  become: false
+  vars:
+    export_dir: "/tmp/ocp3-export"
+    namespaces_to_export:
+      - production
+      - staging
+      - monitoring
+      - logging
+      - ci-cd
+    ocp3_api: "https://ocp3-master.internal:8443"
+    ocp4_api: "https://api.ocp4-prod.example.com:6443"
+
+  tasks:
+
+    - name: Create export directory
+      file:
+        path: "{{ export_dir }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ namespaces_to_export }}"
+
+    # ---- Login to OCP3 ----
+    - name: Login to OCP3 cluster
+      command: >
+        oc login {{ ocp3_api }}
+        --token={{ ocp3_token }}
+        --insecure-skip-tls-verify=true
+      no_log: true
+
+    # ---- Export Deployments ----
+    - name: Export Deployments from each namespace
+      shell: >
+        oc get deploymentconfig,deployment -n {{ item }}
+        -o yaml --export 2>/dev/null |
+        grep -v 'creationTimestamp\|resourceVersion\|uid\|generation\|selfLink' >
+        {{ export_dir }}/{{ item }}/deployments.yaml
+      loop: "{{ namespaces_to_export }}"
+      ignore_errors: true
+
+    # ---- Export Services ----
+    - name: Export Services
+      shell: >
+        oc get svc -n {{ item }} -o yaml --export 2>/dev/null |
+        grep -v 'clusterIP\|clusterIPs\|nodePort' >
+        {{ export_dir }}/{{ item }}/services.yaml
+      loop: "{{ namespaces_to_export }}"
+      ignore_errors: true
+
+    # ---- Export Routes (OCP3) -> Convert to Ingress (OCP4) ----
+    - name: Export Routes
+      shell: >
+        oc get route -n {{ item }} -o yaml >
+        {{ export_dir }}/{{ item }}/routes.yaml
+      loop: "{{ namespaces_to_export }}"
+      ignore_errors: true
+
+    # ---- Export ConfigMaps ----
+    - name: Export ConfigMaps
+      shell: >
+        oc get configmap -n {{ item }} -o yaml --export |
+        grep -v 'kube-root-ca\|openshift-service-ca' >
+        {{ export_dir }}/{{ item }}/configmaps.yaml
+      loop: "{{ namespaces_to_export }}"
+      ignore_errors: true
+
+    # ---- Export Secrets (non-SA) ----
+    - name: Export application Secrets
+      shell: |
+        oc get secrets -n {{ item }} \
+          --field-selector type!=kubernetes.io/service-account-token \
+          -o yaml --export > {{ export_dir }}/{{ item }}/secrets.yaml
+      loop: "{{ namespaces_to_export }}"
+      ignore_errors: true
+      no_log: true
+
+    # ---- Export PersistentVolumeClaims ----
+    - name: Export PVCs
+      shell: >
+        oc get pvc -n {{ item }} -o yaml --export >
+        {{ export_dir }}/{{ item }}/pvcs.yaml
+      loop: "{{ namespaces_to_export }}"
+      ignore_errors: true
+
+    # ---- Export RBAC ----
+    - name: Export RoleBindings
+      shell: >
+        oc get rolebinding -n {{ item }} -o yaml --export >
+        {{ export_dir }}/{{ item }}/rolebindings.yaml
+      loop: "{{ namespaces_to_export }}"
+      ignore_errors: true
+
+    # ---- Export NetworkPolicies ----
+    - name: Export NetworkPolicies
+      shell: >
+        oc get networkpolicy -n {{ item }} -o yaml --export >
+        {{ export_dir }}/{{ item }}/networkpolicies.yaml
+      loop: "{{ namespaces_to_export }}"
+      ignore_errors: true
+
+    # ---- OCP3->OCP4 API Version Conversion ----
+    - name: Replace deprecated OCP3 API versions in exported YAMLs
+      replace:
+        path: "{{ export_dir }}/{{ item[0] }}/{{ item[1] }}"
+        regexp: "{{ item[2] }}"
+        replace: "{{ item[3] }}"
+      with_nested:
+        - "{{ namespaces_to_export }}"
+        - ["deployments.yaml", "services.yaml"]
+        - [["apps.openshift.io/v1", "apps/v1"],
+           ["v1beta1", "v1"],
+           ["extensions/v1beta1", "networking.k8s.io/v1"]]
+      ignore_errors: true
+
+    # ---- Archive exports ----
+    - name: Create tarball of all exports
+      archive:
+        path: "{{ export_dir }}"
+        dest: "/tmp/ocp3-export-{{ ansible_date_time.date }}.tar.gz"
+        format: gz
+
+    - name: Fetch archive to controller
+      fetch:
+        src: "/tmp/ocp3-export-{{ ansible_date_time.date }}.tar.gz"
+        dest: "./exports/"
+        flat: true
+
+    - name: Print summary
+      debug:
+        msg: |
+          OCP3 Export Complete!
+          Exported namespaces: {{ namespaces_to_export | join(', ') }}
+          Archive: ./exports/ocp3-export-{{ ansible_date_time.date }}.tar.gz
+          Next step: Run velero_migration.sh backup on OCP3 cluster.

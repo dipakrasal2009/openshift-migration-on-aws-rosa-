@@ -1,0 +1,723 @@
+================================================================================
+         OCP3 → OCP4 MIGRATION PROJECT — COMPLETE EXPLANATION & INTERVIEW Q&A
+================================================================================
+Author   : Project Documentation
+Purpose  : Full understanding of every file, tool, concept, and decision
+           in this OpenShift migration project. Also includes likely
+           interview questions with strong answers.
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 1: WHAT IS THIS PROJECT? (BIG PICTURE)
+────────────────────────────────────────────────────────────────────────────────
+
+This project migrates a company's entire application platform from:
+
+  SOURCE  → OpenShift 3 (OCP3) running ON-PREMISE (physical data center)
+  TARGET  → OpenShift 4 (OCP4 / ROSA) running on AWS Cloud (ap-south-1 / Mumbai)
+
+Think of it like moving an entire apartment — furniture, files, everything —
+from one city to another, but the "apartment" is running live applications that
+thousands of users depend on.
+
+WHY MIGRATE FROM OCP3 TO OCP4?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- OCP3 is end-of-life (Red Hat stopped support)
+- OCP4 uses Kubernetes Operators, better security (SCC → Pod Security)
+- OCP4 on AWS (ROSA) gives auto-scaling, managed control plane
+- Cloud gives better DR (Disaster Recovery), HA (High Availability)
+- Cost savings: pay only for what you use vs. maintaining physical servers
+
+NAMESPACES BEING MIGRATED:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+  1. production  → Live apps serving real users
+  2. staging     → Pre-production testing environment
+  3. monitoring  → Prometheus, Grafana dashboards
+  4. logging     → EFK stack (Elasticsearch, Fluentd, Kibana)
+  5. ci-cd       → Jenkins / Tekton pipelines
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 2: FILE-BY-FILE EXPLANATION
+────────────────────────────────────────────────────────────────────────────────
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 1: terraform/main.tf  +  terraform/variables.tf
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHAT IS TERRAFORM?
+  Terraform is an Infrastructure as Code (IaC) tool by HashiCorp.
+  Instead of clicking in AWS Console, you write code that describes
+  what infrastructure you want, and Terraform creates it automatically.
+  It is DECLARATIVE — you say "I want this", not "do this step by step".
+
+WHAT DOES main.tf CREATE?
+
+  1. AWS VPC (Virtual Private Cloud)
+     ┌─────────────────────────────────────────────────┐
+     │  VPC: 10.0.0.0/16  (65,536 IP addresses)        │
+     │                                                  │
+     │  Public Subnets (3 — one per AZ)                 │
+     │    ├── ap-south-1a → Load Balancers, Bastion     │
+     │    ├── ap-south-1b → Load Balancers              │
+     │    └── ap-south-1c → Load Balancers              │
+     │                                                  │
+     │  Private Subnets (3 — one per AZ)                │
+     │    ├── ap-south-1a → Worker Nodes                │
+     │    ├── ap-south-1b → Worker Nodes                │
+     │    └── ap-south-1c → Worker Nodes                │
+     └─────────────────────────────────────────────────┘
+
+     WHY PUBLIC + PRIVATE?
+     - Public subnets face the internet (Load Balancers need this)
+     - Private subnets are hidden (Worker nodes should NOT be directly public)
+     - This is the standard "secure cloud architecture" pattern
+
+  2. Internet Gateway (IGW)
+     - Allows resources in PUBLIC subnets to reach the internet
+     - Without this, your Load Balancer can't receive traffic from users
+
+  3. NAT Gateway (one per AZ)
+     - Allows resources in PRIVATE subnets to reach the internet (for updates, pulling images)
+     - But internet CANNOT initiate connections into private subnets
+     - Think of it as a one-way door: inside can go out, outside cannot come in
+     - 3 NAT Gateways = 3 AZs = High Availability (if one AZ fails, others work)
+
+  4. Route Tables
+     - Public Route Table: "all traffic (0.0.0.0/0) → Internet Gateway"
+     - Private Route Table: "all traffic (0.0.0.0/0) → NAT Gateway"
+     - Each subnet is "associated" with a route table
+
+  5. Security Group for OpenShift Nodes
+     - Port 443 (HTTPS) open from within VPC
+     - Port 6443 (OpenShift API) open from admin CIDRs only
+     - Port -1 (all) allowed within cluster nodes (pods need to talk to each other)
+     - All outbound traffic allowed (nodes need to pull images, call APIs)
+
+  6. IAM Role for Worker Nodes
+     - Workers need to pull images from ECR (Elastic Container Registry)
+     - IAM Role: "AmazonEC2ContainerRegistryReadOnly" policy attached
+     - This is the AWS security model: give only what's needed (least privilege)
+
+  7. S3 Bucket for Velero Backups
+     - Velero (migration tool) stores backups here
+     - Versioning ENABLED: you can recover older backups
+     - AES256 Encryption: backups are encrypted at rest
+     - force_destroy=false: prevents accidental deletion
+
+  8. Route53 Private Hosted Zone
+     - Internal DNS for the cluster
+     - e.g., "ocp4-prod.example.com" resolves only inside the VPC
+     - So pods can find each other by name
+
+  TERRAFORM BACKEND (S3 remote state):
+    - tfstate file is stored in S3 bucket "openshift-migration-tfstate"
+    - WHY? So the whole team shares the same state, not just one person's laptop
+    - Without this, two people running terraform apply would conflict
+
+  VARIABLES (variables.tf):
+    - aws_region       = "ap-south-1"     (Mumbai)
+    - cluster_name     = "ocp4-prod"
+    - environment      = "prod"
+    - vpc_cidr         = "10.0.0.0/16"
+    - availability_zones = ["ap-south-1a", "ap-south-1b", "ap-south-1c"]
+    - allowed_admin_cidrs = ["10.0.0.0/8"]  (internal network only)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 2: ansible/ocp3_export_configs.yml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHAT IS ANSIBLE?
+  Ansible is an IT automation tool. It uses YAML "playbooks" to describe
+  tasks to run on remote servers. It's AGENTLESS — it connects via SSH,
+  runs commands, and disconnects. No software needed on the target server.
+
+WHAT DOES THIS PLAYBOOK DO?
+  Connects to the OCP3 master node and exports ALL workload configurations
+  into YAML files, organized by namespace.
+
+  EXPORTS:
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  For each namespace (production, staging, monitoring, ...):     │
+  │                                                                 │
+  │  deployments.yaml    → DeploymentConfigs + Deployments          │
+  │  services.yaml       → All Services (ClusterIP, LoadBalancer)   │
+  │  routes.yaml         → OCP3 Routes (like Ingress in K8s)        │
+  │  configmaps.yaml     → App configuration (non-secret)           │
+  │  secrets.yaml        → Passwords, tokens, certs                 │
+  │  pvcs.yaml           → Persistent Volume Claims (storage)       │
+  │  rolebindings.yaml   → Who can do what in the namespace         │
+  │  networkpolicies.yaml→ Which pods can talk to which pods        │
+  └─────────────────────────────────────────────────────────────────┘
+
+  IMPORTANT: It strips OCP3-specific fields that don't exist in OCP4:
+    - creationTimestamp, resourceVersion, uid, generation, selfLink
+    - clusterIP (will be auto-assigned in OCP4)
+    - nodePort (will be re-assigned)
+    These would CAUSE ERRORS if imported directly into OCP4.
+
+  API VERSION CONVERSION (OCP3 → OCP4):
+    OCP3 used old API versions that OCP4 removed:
+    - apps.openshift.io/v1  →  apps/v1
+    - v1beta1               →  v1
+    - extensions/v1beta1    →  networking.k8s.io/v1
+    The playbook does this with `replace` tasks automatically.
+
+  SECRETS HANDLING:
+    - Exports all secrets EXCEPT service-account tokens
+    - no_log: true → Ansible will NOT print secret values in logs
+    - This is a security best practice
+
+  FINAL OUTPUT:
+    - Creates a .tar.gz archive of everything
+    - Copies it back to your local machine (Ansible controller)
+    - Ready to use for the next step (Velero or manual apply)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 3: scripts/velero_migration.sh
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHAT IS VELERO?
+  Velero (formerly Ark) is an open-source tool for:
+  - Backing up Kubernetes/OpenShift cluster resources
+  - Restoring them to a different cluster
+  - Disaster recovery
+  It works by dumping all K8s objects + volumes to S3, then restoring from S3.
+
+SCRIPT STRUCTURE:
+  The script has 4 modes, controlled by argument:
+    ./velero_migration.sh install   → Install Velero on current cluster
+    ./velero_migration.sh backup    → Run on OCP3 (takes backups)
+    ./velero_migration.sh restore   → Run on OCP4 (restores backups)
+    ./velero_migration.sh validate  → Check if all pods are running
+
+  CONFIGURATION:
+    S3_BUCKET = "ocp4-prod-velero-backup-prod"  (same bucket Terraform created)
+    AWS_REGION = "ap-south-1"
+    BACKUP_NAME = "ocp3-full-migration-YYYYMMDDHHMM"  (timestamped)
+
+  INSTALL VELERO:
+    - Uses AWS plugin (velero-plugin-for-aws:v1.8.0)
+    - Connects to S3 bucket
+    - Reads credentials from ./credentials-velero file
+    - use-volume-snapshots=true → backs up EBS volumes too
+    - default-volumes-to-restic → file-level backup of volumes (safer)
+    - Waits for Velero pod to be Ready before proceeding
+
+  BACKUP (run on OCP3):
+    Loop through each namespace:
+      1. Create a backup: "ocp3-full-migration-TIMESTAMP-production"
+      2. --include-cluster-resources=true (gets CRDs, ClusterRoles too)
+      3. --ttl 720h → backup expires after 30 days
+      4. --wait → script waits until backup is DONE before continuing
+      5. Checks backup STATUS == "Completed", fails loudly if not
+
+    Also creates a CLUSTER-SCOPED backup:
+      - CRDs (Custom Resource Definitions)
+      - ClusterRoles, ClusterRoleBindings
+      - Excludes kube-system, openshift/* (these exist in OCP4 already)
+
+  RESTORE (run on OCP4):
+    1. First restore cluster-scoped resources (CRDs must exist before namespaced resources)
+    2. Create each namespace if it doesn't exist
+    3. Restore each namespace backup
+    4. --restore-volumes=true → also restores PVC data
+    5. Shows all pods after restore
+
+  VALIDATE:
+    - Counts total pods vs running pods per namespace
+    - Gives PASS/FAIL summary
+    - Warns if DNS cutover should wait
+
+  SET -EUO PIPEFAIL:
+    - -e  = exit immediately if any command fails
+    - -u  = treat unset variables as errors
+    - -o pipefail = catch errors in pipes (cmd1 | cmd2)
+    This is production-quality bash safety.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FILE 4: .github/workflows/ocp4-deploy.yml
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+WHAT IS GITHUB ACTIONS?
+  GitHub Actions is a CI/CD (Continuous Integration / Continuous Deployment)
+  platform built into GitHub. When you push code, it automatically runs
+  "workflows" — like building, testing, and deploying your app.
+
+TRIGGERS:
+  - Push to main branch → full pipeline runs
+  - Pull Request to main → only build + scan (no deploy)
+
+  WHY PR-ONLY BUILD?
+  You want to catch bugs and security issues BEFORE merging to main.
+  But you don't want to deploy on every PR, only on actual merges.
+
+PIPELINE STAGES (4 Jobs):
+
+  JOB 1: build-and-push
+  ┌────────────────────────────────────────────────────────────────┐
+  │  1. Checkout code from GitHub                                  │
+  │  2. Configure AWS credentials (from GitHub Secrets)            │
+  │  3. Login to Amazon ECR                                        │
+  │  4. Build Docker image (tagged with git commit SHA)            │
+  │  5. Trivy Security Scan (CRITICAL + HIGH CVEs → fail pipeline) │
+  │  6. Upload scan results to GitHub Security tab (SARIF format)  │
+  │  7. Push image to ECR                                          │
+  │  8. Also tag as "latest" if on main branch                     │
+  └────────────────────────────────────────────────────────────────┘
+
+  WHY GIT SHA AS IMAGE TAG?
+  - git SHA is unique and immutable for every commit
+  - You can always trace which exact code version is running
+  - "latest" tag is also kept for convenience
+
+  TRIVY SCAN:
+  - Scans the Docker image for known CVEs (vulnerabilities)
+  - exit-code: 1 → if CRITICAL or HIGH CVE found, PIPELINE FAILS
+  - This prevents insecure images from reaching production
+  - SARIF format → uploaded to GitHub's Security tab for visibility
+
+  JOB 2: update-helm-values (only on main)
+  ┌────────────────────────────────────────────────────────────────┐
+  │  1. Checkout the GitOps manifests repository                   │
+  │  2. Update values-production.yaml with new image tag (sed)     │
+  │  3. Commit & push the change                                   │
+  │     commit: "chore: update my-app image tag to abc123 [skip ci]"│
+  └────────────────────────────────────────────────────────────────┘
+
+  WHY UPDATE HELM VALUES FILE?
+  This is the GITOPS pattern. The "desired state" of production lives in Git.
+  ArgoCD watches this file. When it changes, ArgoCD automatically deploys.
+  [skip ci] → prevents infinite loop (commit would trigger CI again)
+
+  JOB 3: argocd-deploy (only on main)
+  ┌────────────────────────────────────────────────────────────────┐
+  │  1. Install ArgoCD CLI                                         │
+  │  2. Login to ArgoCD server                                     │
+  │  3. Trigger sync: argocd app sync production-app               │
+  │     --force --prune → removes old resources, forced sync       │
+  │     --timeout 300 → wait up to 5 minutes                       │
+  │  4. Wait for health: argocd app wait --health                  │
+  │  5. Print sync status                                          │
+  └────────────────────────────────────────────────────────────────┘
+
+  WHAT IS ARGOCD?
+  ArgoCD is a GitOps controller. It watches your Git repository and
+  continuously syncs the cluster to match what's in Git.
+  If someone manually changes something in the cluster, ArgoCD reverts it.
+  This ensures Git is always the single source of truth.
+
+  JOB 4: smoke-test (only on main)
+  ┌────────────────────────────────────────────────────────────────┐
+  │  1. Install OpenShift CLI (oc)                                 │
+  │  2. Login to OCP4 cluster                                      │
+  │  3. Wait for deployment rollout to complete                    │
+  │  4. Check pods are Running (count > 0)                         │
+  │  5. HTTP health check: GET https://<route>/health → 200 OK     │
+  │  6. If FAIL: rollback (oc rollout undo)                        │
+  └────────────────────────────────────────────────────────────────┘
+
+  THE FLOW DEPENDENCY CHAIN:
+  build-and-push → update-helm-values → argocd-deploy → smoke-test
+  Each job only runs if the previous succeeded (needs: keyword)
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 3: HOW ALL FILES WORK TOGETHER
+────────────────────────────────────────────────────────────────────────────────
+
+PHASE 1 — INFRASTRUCTURE SETUP
+  terraform apply
+  → Creates VPC, Subnets, S3, IAM, Route53 on AWS
+  → AWS is ready to host the OCP4 cluster
+
+PHASE 2 — CONFIG EXPORT FROM OCP3
+  ansible-playbook ocp3_export_configs.yml
+  → Logs into OCP3 master via SSH
+  → Exports Deployments, Services, Routes, Secrets, PVCs, RBAC
+  → Fixes API versions (OCP3 → OCP4 compatible)
+  → Creates tar.gz archive
+  → Downloads to local machine
+
+PHASE 3 — VELERO BACKUP (on OCP3 cluster)
+  ./velero_migration.sh install   ← installs Velero on OCP3
+  ./velero_migration.sh backup    ← backs up each namespace to S3
+  → 6 backups in S3:
+      ocp3-full-migration-TIMESTAMP-production
+      ocp3-full-migration-TIMESTAMP-staging
+      ocp3-full-migration-TIMESTAMP-monitoring
+      ocp3-full-migration-TIMESTAMP-logging
+      ocp3-full-migration-TIMESTAMP-ci-cd
+      ocp3-full-migration-TIMESTAMP-cluster-resources
+
+PHASE 4 — VELERO RESTORE (on OCP4 cluster)
+  ./velero_migration.sh install   ← installs Velero on OCP4
+  ./velero_migration.sh restore   ← restores all backups from S3 to OCP4
+  ./velero_migration.sh validate  ← checks all pods are running
+
+PHASE 5 — ONGOING CI/CD (post-migration)
+  Developer pushes code → GitHub Actions runs
+  → Docker image built → Trivy scanned
+  → ECR push → Helm values updated
+  → ArgoCD syncs → OCP4 updated
+  → Smoke test validates
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 4: KEY CONCEPTS EXPLAINED SIMPLY
+────────────────────────────────────────────────────────────────────────────────
+
+KUBERNETES VS OPENSHIFT
+  OpenShift is Red Hat's enterprise Kubernetes distribution.
+  OCP4 IS Kubernetes underneath, but adds:
+  - Web console
+  - Stricter security (SCCs, no root by default)
+  - Operators (automated Day 2 operations)
+  - Built-in CI/CD (Tekton, Pipelines)
+
+DEPLOYMENTCONFIG (OCP3) VS DEPLOYMENT (OCP4)
+  DeploymentConfig is an OCP3-only resource. OCP4 uses standard K8s Deployment.
+  During migration, DCs must be converted to Deployments.
+
+VELERO vs ANSIBLE EXPORT — WHAT'S THE DIFFERENCE?
+  Ansible Export:
+  - Exports YAML files (resource definitions)
+  - Good for reviewing and editing before applying
+  - Manual import needed (oc apply -f)
+
+  Velero:
+  - Backs up live cluster state + volume DATA
+  - Restores automatically to new cluster
+  - Better for PVC data (actual file contents, not just the PVC definition)
+  - Both are used together for a complete migration
+
+GITOPS (ArgoCD)
+  In GitOps, Git is the single source of truth for the cluster state.
+  Instead of running "kubectl apply" manually, you:
+  1. Change the Helm values file in Git
+  2. ArgoCD detects the change
+  3. ArgoCD applies it to the cluster
+  Benefits: audit trail, rollback by reverting git commit, no manual errors
+
+HELM
+  Helm is a package manager for Kubernetes.
+  A Helm chart is like a template for Kubernetes resources.
+  values.yaml lets you customize the template (image tag, replica count, etc.)
+  values-production.yaml = production-specific values
+
+TRIVY
+  Open-source vulnerability scanner for containers.
+  Checks Docker images against CVE databases (NVD, Red Hat, etc.)
+  In this pipeline: CRITICAL + HIGH CVEs fail the build.
+  This is called "shift-left security" — catching issues before deployment.
+
+ECR (Elastic Container Registry)
+  AWS's Docker image registry.
+  Private, secure, integrated with IAM.
+  Images are tagged with git SHA for traceability.
+
+SARIF FORMAT
+  Standard format for security scan results.
+  GitHub can read SARIF and display vulnerabilities in the Security tab.
+  Makes it easy for developers to see what needs fixing.
+
+NAT GATEWAY
+  Network Address Translation Gateway.
+  Lets private subnet instances reach the internet (for package updates, etc.)
+  but blocks inbound connections from the internet.
+  Think of it as a one-way mirror.
+
+AVAILABILITY ZONES (AZ)
+  AWS regions are divided into multiple isolated data centers called AZs.
+  ap-south-1 has: ap-south-1a, ap-south-1b, ap-south-1c
+  Spreading resources across 3 AZs = High Availability.
+  If one data center burns down, the other two keep running.
+
+TTL (Time To Live) in Velero
+  --ttl 720h = backup auto-deletes after 720 hours (30 days)
+  Prevents S3 costs from piling up from old backups.
+
+
+────────────────────────────────────────────────────────────────────────────────
+SECTION 5: INTERVIEW QUESTIONS & STRONG ANSWERS
+────────────────────────────────────────────────────────────────────────────────
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GENERAL / ARCHITECTURE QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q1: Can you explain this project at a high level?
+A: This is an end-to-end migration project that moves an organization's
+   application platform from an on-premise OpenShift 3 cluster to a managed
+   OpenShift 4 cluster on AWS (ROSA). The project involves four main layers:
+   infrastructure provisioning with Terraform, configuration export from OCP3
+   using Ansible, data and workload migration using Velero, and post-migration
+   CI/CD using GitHub Actions and ArgoCD. The goal was zero data loss and
+   minimal downtime during the cutover.
+
+Q2: Why did you choose Velero for the migration instead of just re-deploying?
+A: Velero was chosen for two main reasons. First, it handles persistent volume
+   data — not just the Kubernetes resource definitions, but the actual data
+   inside the volumes (using Restic for file-level backups). Second, it preserves
+   the complete namespace state, including RBAC, NetworkPolicies, and all
+   resource metadata. A plain re-deploy from manifests would miss the PVC data
+   and would require rebuilding state manually. We used both Ansible (for manifest
+   export and review) and Velero (for the actual migration including data).
+
+Q3: What was your migration strategy — big bang or phased?
+A: Phased migration. We migrated namespaces individually rather than all at once.
+   Non-critical namespaces like staging and monitoring were migrated first to
+   validate the process. Production was migrated last, after we had confidence
+   in the tooling. Velero creates per-namespace backups, so we could validate
+   each namespace independently before switching DNS.
+
+Q4: How did you handle the difference between OCP3 DeploymentConfigs and OCP4 Deployments?
+A: The Ansible playbook exports both DeploymentConfigs and standard Deployments.
+   We also have a batch API version replacement step that converts deprecated
+   OCP3 API versions to OCP4-compatible ones. For DeploymentConfigs specifically,
+   we converted them to standard Kubernetes Deployments, since OCP4 supports
+   native K8s Deployments and the OCP3-specific DC features are largely replicated
+   or deprecated.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TERRAFORM QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q5: Why do you have both public and private subnets? Why not put everything in public?
+A: Security and best practices. Worker nodes should not be directly accessible
+   from the internet — they should only receive traffic from Load Balancers.
+   Public subnets host only the Load Balancers and NAT Gateways. Private subnets
+   host the worker nodes. The nodes still have outbound internet access via NAT
+   Gateway (for pulling images, updates), but nothing from the internet can
+   initiate a connection to them directly.
+
+Q6: Why three NAT Gateways instead of one?
+A: High availability. If we used a single NAT Gateway in one AZ and that AZ
+   had an outage, all three AZs' private subnets would lose internet access.
+   Having one NAT Gateway per AZ means each AZ is fully self-contained. The
+   extra cost is justified for a production cluster.
+
+Q7: Why is the Terraform state stored in S3?
+A: Remote state enables team collaboration and prevents state conflicts. If
+   the state was only on one developer's laptop, no one else could safely run
+   Terraform. S3 remote state means the team shares a single source of truth.
+   We would also add DynamoDB state locking in production to prevent two people
+   from running Terraform simultaneously.
+
+Q8: What would happen if you ran terraform apply twice?
+A: Terraform is idempotent. On the second run, it compares the current state
+   (in S3 tfstate) with the desired state (in the .tf files). If nothing changed,
+   it does nothing. It only creates, modifies, or destroys resources where there
+   is a difference. This is the core value of Infrastructure as Code.
+
+Q9: How is the S3 bucket for Velero protected?
+A: Three layers: AES256 server-side encryption protects data at rest. S3
+   versioning is enabled so you can recover previous backup versions. And
+   force_destroy=false means Terraform cannot accidentally delete the bucket
+   even if someone runs terraform destroy — they'd get an error and would need
+   to manually empty the bucket first.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ANSIBLE QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q10: Why use Ansible for the export instead of just running oc commands manually?
+A: Automation, repeatability, and documentation. Ansible playbooks are
+   self-documenting, version-controlled, and can be re-run safely. Running
+   oc commands manually across 5 namespaces and 8 resource types means 40+
+   commands with room for human error. The playbook also handles API version
+   conversion automatically. It's also idempotent with ignore_errors where
+   appropriate.
+
+Q11: What does no_log: true do and why is it used?
+A: no_log: true tells Ansible not to print the task's output in logs or console.
+   It's used on tasks that handle sensitive data like tokens (the login task)
+   and secrets (the secret export task). Without it, Ansible would print the
+   full command including the OCP3 token to stdout, which could be captured in
+   CI logs or screenshots and become a security leak.
+
+Q12: Why does the export strip fields like resourceVersion, uid, clusterIP?
+A: These fields are cluster-specific runtime values assigned by Kubernetes.
+   If you apply a manifest with a specific resourceVersion to a new cluster,
+   Kubernetes rejects it or creates conflicts. clusterIP is assigned by the
+   Kubernetes service CIDR and must be auto-assigned on the new cluster.
+   uid is a unique object identifier that must be fresh. Stripping them allows
+   OCP4 to assign correct values on import.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+VELERO QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q13: What is Restic and why is it used with Velero?
+A: Restic is a file-level backup tool. Velero's native volume backup uses
+   cloud snapshots (EBS snapshots), which are AWS-specific and don't work
+   across different storage providers. Restic does file-level backup of volume
+   contents and uploads them to S3. This makes it portable — the backup works
+   regardless of where the source cluster is running. --default-volumes-to-restic
+   makes Restic the default for all volumes.
+
+Q14: Why is cluster-scoped backup done separately and restored first?
+A: Dependencies. Namespaced resources (Pods, Deployments) depend on
+   cluster-scoped resources (CRDs, ClusterRoles). If you restore a namespace
+   that uses a Custom Resource (like a Prometheus ServiceMonitor) before the
+   CRD exists, the restore fails. By restoring cluster-scoped resources first,
+   we ensure all the necessary types exist before namespace objects are created.
+
+Q15: How would you handle a failed restore?
+A: First check velero restore describe <name> and velero restore logs <name>
+   for detailed error messages. Common issues: namespace already exists with
+   conflicting resources (use --existing-resource-policy=update), PVC storage
+   class mismatch (OCP3 used NFS, OCP4 uses EBS — need to map storage classes),
+   or API version incompatibilities. Velero restores are partially applied —
+   successfully restored resources stay, failed ones are reported separately.
+
+Q16: What is TTL in Velero backup and why 720h?
+A: TTL (Time to Live) is how long the backup is retained before Velero auto-
+   deletes it. 720h = 30 days. This balances cost (S3 storage) and safety
+   (keeping backups long enough to detect issues post-migration). After 30 days,
+   if the migration is stable, the backups are no longer needed.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CI/CD / GITHUB ACTIONS QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q17: What is GitOps and how does ArgoCD implement it?
+A: GitOps is a practice where Git is the single source of truth for the
+   desired state of infrastructure and applications. Changes are made through
+   Git commits, not direct cluster commands. ArgoCD is a Kubernetes controller
+   that continuously watches a Git repository. When the repo changes, ArgoCD
+   detects the diff and applies changes to the cluster. If someone manually
+   changes something in the cluster outside of Git, ArgoCD reverts it to match
+   Git. This provides auditability, rollback capability, and prevents config drift.
+
+Q18: Why use git SHA as the Docker image tag instead of a version number?
+A: Git SHA is automatically unique, immutable, and traceably linked to
+   exactly one commit. A version number requires manual management and is easy
+   to forget to bump. With SHA tags, you always know exactly what code is
+   running in production and can trace it back to the commit, the PR, and the
+   developer. The "latest" tag is a convenience alias but should never be
+   used for production tracking.
+
+Q19: Why does the pipeline fail on HIGH CVEs? Isn't that too strict?
+A: For production financial or enterprise workloads, yes, this is appropriate.
+   HIGH and CRITICAL CVEs represent real exploitable vulnerabilities. Shipping
+   a known vulnerable image to production is a security incident waiting to
+   happen. The severity threshold can be tuned (exit-code: 0 to warn but not
+   fail), but failing the pipeline forces the team to address security debt
+   rather than deferring it indefinitely.
+
+Q20: How does the pipeline prevent an infinite CI loop when updating Helm values?
+A: The commit message includes [skip ci]. GitHub Actions checks for this
+   string in commit messages and skips triggering the workflow for commits
+   containing it. Without this, the update-helm-values job would push a commit,
+   which would trigger a new pipeline run, which would push another commit...
+   endlessly.
+
+Q21: What is the purpose of the smoke test job?
+A: The smoke test is a fast sanity check after deployment to verify the
+   application is actually serving traffic correctly. It checks two things:
+   (1) that pods are in Running state (no crash loops), and (2) that the HTTP
+   health endpoint returns 200 OK (the app is actually responding). If this
+   fails, the pipeline automatically runs oc rollout undo to revert to the
+   previous deployment. This implements automatic rollback on deploy failure.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SECURITY QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q22: How are secrets managed in this project?
+A: Multiple layers. In GitHub Actions, secrets are stored as GitHub Encrypted
+   Secrets (never visible in logs). In Ansible, no_log: true prevents secret
+   logging. The Velero credentials file (credentials-velero) is in .gitignore.
+   Terraform variables containing sensitive values should use terraform.tfvars
+   (also gitignored) rather than defaults. Kubernetes secrets are backed up
+   by Velero encrypted in S3 with AES256. For production hardening, I would
+   add HashiCorp Vault or AWS Secrets Manager for secret rotation.
+
+Q23: What is the principle of least privilege and where is it applied here?
+A: Least privilege means giving a resource only the permissions it absolutely
+   needs. Examples in this project: the OpenShift worker IAM role only gets
+   AmazonEC2ContainerRegistryReadOnly (not full ECR or S3 access), the security
+   group only allows port 6443 from admin CIDRs (not public internet),
+   and the allowed_admin_cidrs restricts OpenShift API access to the internal
+   network (10.0.0.0/8) only.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SCENARIO / TROUBLESHOOTING QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q24: What would you do if the Velero restore shows pods are CrashLooping?
+A: Check logs: oc logs <pod> -n <namespace>. Common causes after migration:
+   (1) Storage class mismatch — PVC bound to OCP3 NFS storage class that
+   doesn't exist in OCP4; fix by creating a StorageClass mapping in Velero.
+   (2) Image pull errors — image still pointing to on-prem registry; update
+   image references to ECR. (3) Missing ConfigMaps/Secrets that weren't
+   included in the backup. (4) NetworkPolicy blocking required connections.
+
+Q25: The Trivy scan fails on every build because of a base image vulnerability.
+     What do you do?
+A: Options in order: (1) Update the base image in Dockerfile to a patched
+   version. (2) If no patched version exists, pin to a specific digest that
+   has the fewest vulnerabilities. (3) If the CVE is a false positive or
+   affects a package your app doesn't use, add it to a .trivyignore file with
+   justification. (4) As a last resort, temporarily lower the exit-code to 0
+   (warn only) and create a ticket to fix within the sprint. Never leave it
+   unfixed permanently.
+
+Q26: How would you do a dry run of the migration before actually migrating?
+A: Several approaches: (1) Use velero backup --wait then velero restore in a
+   separate TEST namespace (not production) to verify restore works. (2) For
+   Terraform, terraform plan shows what WILL be created without creating it.
+   (3) For Ansible, use --check flag (dry run mode — no changes applied).
+   (4) Run the full migration on a staging OCP4 cluster first before touching
+   production. (5) For the GitHub Actions pipeline, test on a feature branch
+   that deploys to staging, not production.
+
+Q27: What's your rollback plan if the migration fails?
+A: OCP3 stays live until we cut DNS. The migration plan is:
+   Phase 1-4: OCP3 remains in production, OCP4 is set up in parallel.
+   Phase 5: DNS TTL is reduced to 60 seconds 24 hours before cutover.
+   Cutover: DNS is switched to OCP4. OCP3 kept on standby for 48 hours.
+   Rollback: If critical issues found on OCP4, DNS is switched back to OCP3
+   within minutes (low TTL means fast propagation). Velero backups remain in
+   S3 for 30 days as a safety net.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+BONUS / ADVANCED QUESTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q28: If you were to improve this project, what would you add?
+A: Several improvements: (1) DynamoDB table for Terraform state locking to
+   prevent concurrent runs. (2) HashiCorp Vault or AWS Secrets Manager for
+   secret rotation instead of static credentials. (3) Slack/PagerDuty
+   notifications in the GitHub Actions pipeline for failures. (4) A Velero
+   schedule for ongoing backup (not just migration). (5) Kyverno or OPA Gatekeeper
+   for policy enforcement on OCP4. (6) Pre-migration runbook with exact commands
+   and expected outputs for the migration team to follow. (7) Automated storage
+   class mapping configuration for Velero to handle NFS → EBS conversion.
+
+Q29: What is ROSA and how is it different from self-managed OCP4?
+A: ROSA (Red Hat OpenShift Service on AWS) is a managed OpenShift offering
+   jointly supported by Red Hat and AWS. With ROSA, AWS manages the control
+   plane (master nodes) — you only manage worker nodes and applications.
+   Self-managed OCP4 means you manage everything including master nodes.
+   ROSA is more expensive but reduces operational overhead significantly.
+   For this migration, ROSA was chosen to reduce ongoing maintenance burden
+   after migration.
+
+Q30: How does the pipeline handle secrets like AWS keys? Aren't they in the YAML file?
+A: No — the YAML file references ${{ secrets.AWS_ACCESS_KEY_ID }} which is
+   a GitHub Secrets reference. The actual key values are stored encrypted in
+   GitHub's secrets store and are never written to the YAML file or visible in
+   logs. GitHub Actions injects them as environment variables at runtime. The
+   YAML file can be committed to a public repository without exposing credentials.
+   GitHub also automatically masks secret values if they accidentally appear in
+   logs.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
