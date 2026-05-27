@@ -1,0 +1,377 @@
+# ============================================================
+# GitHub Actions CI/CD Workflow — OpenShift 4.x on AWS (ROSA)
+# File: .github/workflows/ocp4-deploy.yml
+#
+# UPDATED: Blue-Green Deployment via Argo Rollouts
+#
+# Pipeline stages:
+#   1. Build Docker image
+#   2. Security scan with Trivy
+#   3. Push to Amazon ECR
+#   4. Update Helm values (GitOps)
+#   5. ArgoCD sync → Argo Rollouts creates GREEN environment
+#   6. Smoke test on GREEN (preview) environment
+#   7. Promote GREEN to BLUE (switch 100% live traffic)
+#   8. On failure → Abort rollout (keep BLUE live, no downtime)
+#
+# Required GitHub Secrets:
+#   AWS_ACCESS_KEY_ID        - AWS IAM access key
+#   AWS_SECRET_ACCESS_KEY    - AWS IAM secret key
+#   AWS_REGION               - e.g. ap-south-1
+#   ECR_REGISTRY             - e.g. 123456789.dkr.ecr.ap-south-1.amazonaws.com
+#   OCP4_SERVER              - https://api.ocp4-prod.example.com:6443
+#   OCP4_TOKEN               - OpenShift service account token
+#   ARGOCD_SERVER            - argocd.ocp4-prod.example.com
+#   ARGOCD_AUTH_TOKEN        - ArgoCD API token
+# ============================================================
+
+name: OCP4 Blue-Green Build, Scan & Deploy
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  APP_NAME: my-app
+  OCP_NAMESPACE: production
+  HELM_CHART_PATH: helm/my-app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ----------------------------------------------------------
+  # JOB 1: Build & Push Docker Image to ECR
+  # ----------------------------------------------------------
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        id: build
+        run: |
+          IMAGE_URI="${{ secrets.ECR_REGISTRY }}/${{ env.APP_NAME }}:${{ env.IMAGE_TAG }}"
+          docker build \
+            --build-arg APP_VERSION=${{ env.IMAGE_TAG }} \
+            --tag "${IMAGE_URI}" \
+            --file Dockerfile .
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      # ---- Security Scan with Trivy ----
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:    ${{ steps.build.outputs.image_uri }}
+          format:       sarif
+          output:       trivy-results.sarif
+          severity:     CRITICAL,HIGH
+          exit-code:    1
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Push image to ECR
+        run: docker push ${{ steps.build.outputs.image_uri }}
+
+      - name: Tag image as latest (main branch only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          LATEST_URI="${{ secrets.ECR_REGISTRY }}/${{ env.APP_NAME }}:latest"
+          docker tag ${{ steps.build.outputs.image_uri }} "${LATEST_URI}"
+          docker push "${LATEST_URI}"
+
+  # ----------------------------------------------------------
+  # JOB 2: Update Helm values & commit (triggers ArgoCD sync)
+  # ----------------------------------------------------------
+  update-helm-values:
+    name: Update Helm Image Tag
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout GitOps manifests repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update image tag in Helm values
+        run: |
+          sed -i "s|tag:.*|tag: \"${{ env.IMAGE_TAG }}\"|g" \
+            ${{ env.HELM_CHART_PATH }}/values-production.yaml
+          sed -i "s|repository:.*|repository: ${{ secrets.ECR_REGISTRY }}/${{ env.APP_NAME }}|g" \
+            ${{ env.HELM_CHART_PATH }}/values-production.yaml
+
+      - name: Commit and push updated Helm values
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add ${{ env.HELM_CHART_PATH }}/values-production.yaml
+          git commit -m "chore: update ${{ env.APP_NAME }} image tag to ${{ env.IMAGE_TAG }} [skip ci]"
+          git push
+
+  # ----------------------------------------------------------
+  # JOB 3: ArgoCD Sync — creates GREEN (preview) environment
+  # ----------------------------------------------------------
+  argocd-deploy:
+    name: ArgoCD Sync — Deploy GREEN Environment
+    runs-on: ubuntu-latest
+    needs: update-helm-values
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+      - name: Login to ArgoCD
+        run: |
+          argocd login ${{ secrets.ARGOCD_SERVER }} \
+            --auth-token ${{ secrets.ARGOCD_AUTH_TOKEN }} \
+            --grpc-web \
+            --insecure
+
+      - name: Trigger ArgoCD sync
+        run: |
+          argocd app sync production-app \
+            --force \
+            --prune \
+            --timeout 300
+
+      - name: Wait for ArgoCD sync to be Healthy
+        run: |
+          argocd app wait production-app \
+            --health \
+            --timeout 300
+
+      - name: Print sync status
+        run: argocd app get production-app
+
+  # ----------------------------------------------------------
+  # JOB 4: Smoke Test on GREEN (preview) — NOT live traffic yet
+  # GREEN environment is running but 0% traffic from users
+  # We test it privately before promoting
+  # ----------------------------------------------------------
+  smoke-test-green:
+    name: Smoke Test on GREEN (Preview) Environment
+    runs-on: ubuntu-latest
+    needs: argocd-deploy
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz
+          tar xvf openshift-client-linux.tar.gz
+          sudo mv oc /usr/local/bin/
+
+      - name: Install Argo Rollouts kubectl plugin
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Login to OCP4 cluster
+        run: |
+          oc login ${{ secrets.OCP4_SERVER }} \
+            --token=${{ secrets.OCP4_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Wait for GREEN pods to be Running
+        run: |
+          echo "Waiting for GREEN (preview) pods to be ready..."
+          # Argo Rollouts labels preview pods with rollouts-pod-template-hash
+          # Wait until rollout is Paused (GREEN is up, waiting for promotion)
+          timeout 300 bash -c '
+            while true; do
+              STATUS=$(kubectl argo rollouts get rollout ${{ env.APP_NAME }} \
+                -n ${{ env.OCP_NAMESPACE }} \
+                -o jsonpath="{.status.phase}" 2>/dev/null)
+              echo "Rollout phase: $STATUS"
+              if [[ "$STATUS" == "Paused" ]]; then
+                echo "GREEN environment is ready for smoke testing"
+                break
+              fi
+              sleep 10
+            done
+          '
+
+      - name: Show rollout status
+        run: |
+          kubectl argo rollouts get rollout ${{ env.APP_NAME }} \
+            -n ${{ env.OCP_NAMESPACE }}
+
+      - name: HTTP smoke test on GREEN (preview service)
+        run: |
+          # Get the PREVIEW route host (points to GREEN, not live traffic)
+          PREVIEW_HOST=$(oc get route ${{ env.APP_NAME }}-preview \
+            -n ${{ env.OCP_NAMESPACE }} \
+            -o jsonpath='{.spec.host}')
+          echo "Testing GREEN at: https://${PREVIEW_HOST}/health"
+
+          # Retry up to 5 times
+          for i in {1..5}; do
+            HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" \
+              "https://${PREVIEW_HOST}/health")
+            echo "Attempt $i — HTTP Status: ${HTTP_STATUS}"
+            [ "${HTTP_STATUS}" == "200" ] && break
+            [ "$i" == "5" ] && (echo "Smoke test FAILED after 5 attempts" && exit 1)
+            sleep 10
+          done
+          echo "GREEN smoke test PASSED"
+
+      - name: Check GREEN pod count
+        run: |
+          RUNNING=$(oc get pods -n ${{ env.OCP_NAMESPACE }} \
+            -l app=${{ env.APP_NAME }},env=green \
+            --field-selector=status.phase=Running \
+            --no-headers | wc -l)
+          echo "GREEN Running pods: ${RUNNING}"
+          [ "${RUNNING}" -gt "0" ] || (echo "No GREEN pods running!" && exit 1)
+
+  # ----------------------------------------------------------
+  # JOB 5: PROMOTE — Switch 100% traffic from BLUE to GREEN
+  # Only runs if smoke test PASSED
+  # This is the zero-downtime traffic switch
+  # ----------------------------------------------------------
+  promote-green-to-blue:
+    name: Promote GREEN → BLUE (Switch Live Traffic)
+    runs-on: ubuntu-latest
+    needs: smoke-test-green
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz
+          tar xvf openshift-client-linux.tar.gz
+          sudo mv oc /usr/local/bin/
+
+      - name: Install Argo Rollouts kubectl plugin
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Login to OCP4 cluster
+        run: |
+          oc login ${{ secrets.OCP4_SERVER }} \
+            --token=${{ secrets.OCP4_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Promote GREEN to BLUE (instant traffic switch)
+        run: |
+          echo "Promoting GREEN to BLUE — switching 100% live traffic..."
+          kubectl argo rollouts promote ${{ env.APP_NAME }} \
+            -n ${{ env.OCP_NAMESPACE }}
+          echo "Traffic switched to GREEN (now BLUE)"
+
+      - name: Wait for promotion to complete
+        run: |
+          kubectl argo rollouts status ${{ env.APP_NAME }} \
+            -n ${{ env.OCP_NAMESPACE }} \
+            --timeout 300s
+
+      - name: Verify live traffic on new BLUE
+        run: |
+          LIVE_HOST=$(oc get route ${{ env.APP_NAME }}-active \
+            -n ${{ env.OCP_NAMESPACE }} \
+            -o jsonpath='{.spec.host}')
+          echo "Verifying live traffic at: https://${LIVE_HOST}/health"
+          HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" \
+            "https://${LIVE_HOST}/health")
+          echo "Live HTTP Status: ${HTTP_STATUS}"
+          [ "${HTTP_STATUS}" == "200" ] || \
+            (echo "Live health check FAILED after promotion!" && exit 1)
+
+      - name: Print final rollout state
+        run: |
+          kubectl argo rollouts get rollout ${{ env.APP_NAME }} \
+            -n ${{ env.OCP_NAMESPACE }}
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "✅ Blue-Green deployment SUCCEEDED"
+          echo "   App   : ${{ env.APP_NAME }}"
+          echo "   Tag   : ${{ env.IMAGE_TAG }}"
+          echo "   GREEN promoted to BLUE — 100% live traffic on new version"
+
+  # ----------------------------------------------------------
+  # JOB 6: ABORT on failure — keep BLUE (old version) live
+  # Runs only if smoke-test-green FAILED
+  # Zero downtime — users never saw the broken GREEN version
+  # ----------------------------------------------------------
+  abort-on-failure:
+    name: Abort Rollout — Keep BLUE Live (Rollback)
+    runs-on: ubuntu-latest
+    needs: smoke-test-green
+    if: failure() && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Install OpenShift CLI
+        run: |
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz
+          tar xvf openshift-client-linux.tar.gz
+          sudo mv oc /usr/local/bin/
+
+      - name: Install Argo Rollouts kubectl plugin
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Login to OCP4 cluster
+        run: |
+          oc login ${{ secrets.OCP4_SERVER }} \
+            --token=${{ secrets.OCP4_TOKEN }} \
+            --insecure-skip-tls-verify=true
+
+      - name: Abort rollout — GREEN deleted, BLUE stays live
+        run: |
+          echo "Smoke test FAILED — aborting rollout"
+          echo "BLUE (old version) remains 100% live — zero downtime maintained"
+          kubectl argo rollouts abort ${{ env.APP_NAME }} \
+            -n ${{ env.OCP_NAMESPACE }}
+
+      - name: Confirm BLUE is still healthy
+        run: |
+          LIVE_HOST=$(oc get route ${{ env.APP_NAME }}-active \
+            -n ${{ env.OCP_NAMESPACE }} \
+            -o jsonpath='{.spec.host}')
+          HTTP_STATUS=$(curl -sk -o /dev/null -w "%{http_code}" \
+            "https://${LIVE_HOST}/health")
+          echo "BLUE health check after abort: ${HTTP_STATUS}"
+
+      - name: Notify on failure
+        run: |
+          echo "❌ Blue-Green deployment ABORTED"
+          echo "   Reason : GREEN smoke test failed"
+          echo "   Action : BLUE (old version) kept live — no user impact"
+          echo "   Tag    : ${{ env.IMAGE_TAG }} was NOT promoted"

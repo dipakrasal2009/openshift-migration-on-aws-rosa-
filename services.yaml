@@ -1,0 +1,47 @@
+{{/* ============================================================
+   Helm Template: Blue-Green Services
+   File: helm/my-app/templates/services.yaml
+
+   TWO services are required for Blue-Green:
+   1. active  → BLUE — receives 100% live user traffic
+   2. preview → GREEN — receives 0% traffic (internal testing only)
+
+   Argo Rollouts manages which pods each service points to.
+   ============================================================ */}}
+
+# ---- SERVICE 1: ACTIVE (BLUE) — Live User Traffic ----
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.appName }}-active
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.appName }}
+    role: active   # BLUE — this is what users hit
+spec:
+  selector:
+    app: {{ .Values.appName }}
+    # Argo Rollouts auto-updates this selector to point to BLUE pods
+  ports:
+    - port: 80
+      targetPort: {{ .Values.containerPort }}
+      protocol: TCP
+
+---
+# ---- SERVICE 2: PREVIEW (GREEN) — Internal Testing Only ----
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.appName }}-preview
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.appName }}
+    role: preview   # GREEN — only pipeline smoke test hits this
+spec:
+  selector:
+    app: {{ .Values.appName }}
+    # Argo Rollouts auto-updates this selector to point to GREEN pods
+  ports:
+    - port: 80
+      targetPort: {{ .Values.containerPort }}
+      protocol: TCP

@@ -1,0 +1,483 @@
+================================================================
+     COMPLETE DEPLOYMENT COMMANDS — OCP3 TO OCP4 MIGRATION
+     (Run these in ORDER, one phase at a time)
+================================================================
+
+
+================================================================
+PHASE 0 — PREREQUISITES (Install tools on your local machine)
+================================================================
+
+# 1. Install AWS CLI
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip
+sudo ./aws/install
+aws --version
+
+# 2. Configure AWS credentials
+aws configure
+# It will ask:q
+# AWS Access Key ID     → paste your key
+# AWS Secret Access Key → paste your secret
+# Default region        → ap-south-1
+# Default output format → json
+
+# 3. Install Terraform
+sudo apt-get update && sudo apt-get install -y gnupg software-properties-common
+wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt update && sudo apt install terraform
+terraform --version
+
+# 4. Install Ansible
+sudo apt update
+sudo apt install -y ansible
+ansible --version
+
+# 5. Install OpenShift CLI (oc)
+curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/latest/openshift-client-linux.tar.gz
+tar xvf openshift-client-linux.tar.gz
+sudo mv oc kubectl /usr/local/bin/
+oc version
+
+# 6. Install Velero CLI
+curl -LO https://github.com/vmware-tanzu/velero/releases/download/v1.12.0/velero-v1.12.0-linux-amd64.tar.gz
+tar xvf velero-v1.12.0-linux-amd64.tar.gz
+sudo mv velero-v1.12.0-linux-amd64/velero /usr/local/bin/
+velero version
+
+# 7. Install ROSA CLI
+curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/rosa/latest/rosa-linux.tar.gz
+tar xvf rosa-linux.tar.gz
+sudo mv rosa /usr/local/bin/
+rosa version
+
+# 8. Install Helm
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+
+================================================================
+PHASE 1 — CREATE ROSA CLUSTER ON AWS
+================================================================
+
+# WHAT IS ROSA?
+# ROSA = Red Hat OpenShift Service on AWS
+# AWS manages the control plane (master nodes) for you
+# You only manage worker nodes and applications
+
+
+# STEP 1 — Enable ROSA in your AWS account (one time only)
+rosa login
+# It will open browser → login with Red Hat account
+# If you don't have Red Hat account → create free at: https://console.redhat.com
+
+# STEP 2 — Link your AWS account to Red Hat
+rosa init
+# This checks:
+# ✓ AWS credentials configured
+# ✓ Required IAM permissions exist
+# ✓ ROSA service is enabled
+
+# STEP 3 — Enable ROSA service in AWS (if not already)
+aws rosa enable-service --region ap-south-1
+# OR go to AWS Console → search ROSA → click Enable
+
+# STEP 4 — Create required IAM roles for ROSA (one time only)
+rosa create account-roles --mode auto --yes
+# This creates:
+# - ManagedOpenShift-Installer-Role
+# - ManagedOpenShift-ControlPlane-Role
+# - ManagedOpenShift-Worker-Role
+# - ManagedOpenShift-Support-Role
+
+# STEP 5 — Create the ROSA Cluster
+rosa create cluster \
+  --cluster-name ocp4-prod \
+  --region ap-south-1 \
+  --version 4.14.0 \
+  --replicas 3 \
+  --machine-cidr 10.0.0.0/16 \
+  --service-cidr 172.30.0.0/16 \
+  --pod-cidr 10.128.0.0/14 \
+  --host-prefix 23 \
+  --multi-az \
+  --enable-autoscaling \
+  --min-replicas 3 \
+  --max-replicas 6 \
+  --compute-machine-type m5.xlarge \
+  --yes
+# --multi-az      → spreads across 3 availability zones (HA)
+# --replicas 3    → 3 worker nodes to start
+# --autoscaling   → auto adds nodes when load increases
+# Takes 30-45 minutes to fully create
+
+# STEP 6 — Watch cluster creation progress
+rosa describe cluster --cluster ocp4-prod
+# Keep running this until "State: ready"
+
+# OR watch continuously
+watch -n 30 "rosa describe cluster --cluster ocp4-prod | grep State"
+
+# STEP 7 — Create cluster admin user
+rosa create admin --cluster ocp4-prod
+# Output will show:
+# oc login https://api.ocp4-prod.xxxx.openshiftapps.com:6443 \
+#   --username cluster-admin \
+#   --password XXXXXXXX
+# SAVE THIS OUTPUT — you need it to login
+
+# STEP 8 — Login to your new OCP4 cluster
+oc login https://api.ocp4-prod.xxxx.openshiftapps.com:6443 \
+  --username cluster-admin \
+  --password <password-from-above>
+
+# STEP 9 — Verify cluster is working
+oc get nodes
+oc get clusterversion
+oc whoami
+
+
+================================================================
+PHASE 2 — PROVISION AWS INFRASTRUCTURE (Terraform)
+================================================================
+
+# Go to terraform folder
+cd terraform/
+
+# Create your tfvars file (copy from example)
+cp example.tfvars terraform.tfvars
+
+# Edit the values
+nano terraform.tfvars
+# Change these values:
+# aws_region          = "ap-south-1"
+# cluster_name        = "ocp4-prod"
+# environment         = "prod"
+# base_domain         = "yourdomain.com"    ← your actual domain
+# allowed_admin_cidrs = ["YOUR.IP.ADDRESS/32"]
+
+# Initialize Terraform (downloads AWS provider)
+terraform init
+
+# Preview what will be created (no actual changes)
+terraform plan -out=tfplan
+
+# READ the plan carefully — make sure it looks correct
+# You should see: VPC, Subnets, IGW, NAT GW, S3, IAM, Route53
+
+# Apply (actually create everything in AWS)
+terraform apply tfplan
+
+# Verify resources in AWS
+aws ec2 describe-vpcs --region ap-south-1
+aws s3 ls | grep velero
+
+
+================================================================
+PHASE 3 — EXPORT OCP3 CONFIGS (Ansible)
+================================================================
+
+# Go to ansible folder
+cd ../ansible/
+
+# Copy the inventory example and fill in your OCP3 details
+cp inventory.ini.example inventory.ini
+nano inventory.ini
+# Change:
+# ocp3-master.internal → your actual OCP3 master IP or hostname
+# ansible_ssh_private_key_file → path to your SSH key
+
+# Test Ansible can reach the OCP3 master
+ansible ocp3_master -i inventory.ini -m ping
+
+# Get your OCP3 login token
+# Login to OCP3 first:
+oc login https://ocp3-master.internal:8443 --username admin
+# Get token:
+oc whoami --show-token
+# Copy the token
+
+# Run the export playbook
+ansible-playbook ocp3_export_configs.yml \
+  -i inventory.ini \
+  -e "ocp3_token=<paste-your-token-here>"
+
+# Check exported files
+ls ./exports/
+# You should see: ocp3-export-YYYY-MM-DD.tar.gz
+
+# Extract and verify
+tar xvf ./exports/ocp3-export-*.tar.gz -C /tmp/
+ls /tmp/ocp3-export/
+# You should see folders: production/ staging/ monitoring/ logging/ ci-cd/
+# Each folder has: deployments.yaml services.yaml secrets.yaml etc.
+
+
+================================================================
+PHASE 4 — VELERO BACKUP FROM OCP3
+================================================================
+
+# First — login to OCP3 cluster
+oc login https://ocp3-master.internal:8443 \
+  --token=<your-ocp3-token> \
+  --insecure-skip-tls-verify=true
+
+# Create Velero credentials file
+cat > credentials-velero <<EOF
+[default]
+aws_access_key_id=<YOUR_AWS_ACCESS_KEY>
+aws_secret_access_key=<YOUR_AWS_SECRET_KEY>
+EOF
+
+# Go to scripts folder
+cd ../scripts/
+
+# Make script executable
+chmod +x velero_migration.sh
+
+# STEP 1 — Install Velero on OCP3 cluster
+./velero_migration.sh install
+
+# Verify Velero is running
+oc get pods -n velero
+# Should show: velero-xxxx   Running
+
+# STEP 2 — Run the backup
+./velero_migration.sh backup
+# This will create 6 backups in S3:
+# ocp3-full-migration-TIMESTAMP-production
+# ocp3-full-migration-TIMESTAMP-staging
+# ocp3-full-migration-TIMESTAMP-monitoring
+# ocp3-full-migration-TIMESTAMP-logging
+# ocp3-full-migration-TIMESTAMP-ci-cd
+# ocp3-full-migration-TIMESTAMP-cluster-resources
+# Takes 20-60 minutes depending on data size
+
+# Verify backups exist in S3
+aws s3 ls s3://ocp4-prod-velero-backup-prod/
+velero backup get
+# All should show STATUS = Completed
+
+
+================================================================
+PHASE 5 — VELERO RESTORE TO OCP4
+================================================================
+
+# Login to OCP4 cluster
+oc login https://api.ocp4-prod.xxxx.openshiftapps.com:6443 \
+  --username cluster-admin \
+  --password <your-password>
+
+# Make sure you are on OCP4 now
+oc whoami
+oc get nodes   # should show OCP4 nodes
+
+# Create Velero credentials file (same as before)
+cat > credentials-velero <<EOF
+[default]
+aws_access_key_id=<YOUR_AWS_ACCESS_KEY>
+aws_secret_access_key=<YOUR_AWS_SECRET_KEY>
+EOF
+
+# STEP 1 — Install Velero on OCP4
+./velero_migration.sh install
+
+# STEP 2 — Restore everything
+./velero_migration.sh restore
+# Order: cluster-resources first → then each namespace
+# Takes 20-60 minutes
+
+# STEP 3 — Validate everything is running
+./velero_migration.sh validate
+# Output: PASS=5, FAIL=0  ← what you want to see
+
+# Manual verification
+oc get pods -n production
+oc get pods -n staging
+oc get pods -n monitoring
+oc get pods -n logging
+oc get pods -n ci-cd
+
+# Check services and routes
+oc get svc -n production
+oc get routes -n production
+
+
+================================================================
+PHASE 6 — SETUP CI/CD (GitHub Actions + ArgoCD)
+================================================================
+
+# STEP 1 — Create ECR Repository
+aws ecr create-repository \
+  --repository-name my-app \
+  --region ap-south-1
+# Copy the repositoryUri from output
+# Example: 123456789.dkr.ecr.ap-south-1.amazonaws.com/my-app
+
+# STEP 2 — Install ArgoCD on OCP4
+oc create namespace argocd
+oc apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for ArgoCD to be ready
+oc wait --for=condition=Ready pod -l app.kubernetes.io/name=argocd-server \
+  -n argocd --timeout=300s
+
+# Get ArgoCD admin password
+oc -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d
+# Copy this password
+
+# Expose ArgoCD route
+oc -n argocd expose svc argocd-server
+oc get route -n argocd
+# Note the ArgoCD URL
+
+# STEP 3 — Login to ArgoCD CLI
+argocd login <argocd-route-host> \
+  --username admin \
+  --password <password-from-above> \
+  --insecure
+
+# STEP 4 — Create ArgoCD Application
+argocd app create production-app \
+  --repo https://github.com/YOUR_USERNAME/ocp3-to-ocp4-migration \
+  --path helm/my-app \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace production \
+  --sync-policy automated \
+  --auto-prune \
+  --self-heal
+
+# STEP 5 — Add GitHub Secrets
+# Go to: GitHub → Your Repo → Settings → Secrets → Actions
+# Add these one by one:
+#   AWS_ACCESS_KEY_ID      → your AWS access key
+#   AWS_SECRET_ACCESS_KEY  → your AWS secret key
+#   AWS_REGION             → ap-south-1
+#   ECR_REGISTRY           → 123456789.dkr.ecr.ap-south-1.amazonaws.com
+#   OCP4_SERVER            → https://api.ocp4-prod.xxxx.openshiftapps.com:6443
+#   OCP4_TOKEN             → oc whoami --show-token (run this on OCP4)
+#   ARGOCD_SERVER          → your argocd route host
+#   ARGOCD_AUTH_TOKEN      → argocd account generate-token --account admin
+
+# Get OCP4 token for GitHub Secrets
+oc whoami --show-token
+
+# Get ArgoCD token for GitHub Secrets
+argocd account generate-token --account admin
+
+# STEP 6 — Push code and trigger pipeline
+git add .
+git commit -m "initial deployment"
+git push origin main
+# Go to GitHub → Actions tab → watch pipeline run
+
+
+================================================================
+PHASE 7 — DNS CUTOVER (Final Step)
+================================================================
+
+# 24 hours before cutover — lower DNS TTL to 60 seconds
+# Go to your DNS provider (Route53 or any other)
+# Find your domain's A record or CNAME
+# Change TTL from 3600 → 60
+
+# Get OCP4 Load Balancer address
+oc get svc -n production
+# Note the EXTERNAL-IP of your load balancer
+
+# OR get the Route hostname
+oc get route my-app -n production -o jsonpath='{.spec.host}'
+
+# On cutover day — update DNS to point to OCP4
+aws route53 change-resource-record-sets \
+  --hosted-zone-id <YOUR_ZONE_ID> \
+  --change-batch '{
+    "Changes": [{
+      "Action": "UPSERT",
+      "ResourceRecordSet": {
+        "Name": "app.yourdomain.com",
+        "Type": "CNAME",
+        "TTL": 60,
+        "ResourceRecords": [{"Value": "<OCP4-ROUTE-HOST>"}]
+      }
+    }]
+  }'
+
+# Verify DNS propagated
+nslookup app.yourdomain.com
+curl -k https://app.yourdomain.com/health
+# Should return 200 OK from OCP4 now
+
+# Keep OCP3 on standby for 48 hours
+# If anything wrong → change DNS back to OCP3 (takes 60 seconds to propagate)
+
+
+================================================================
+USEFUL DAILY COMMANDS AFTER MIGRATION
+================================================================
+
+# Check cluster health
+oc get nodes
+oc get clusterversion
+
+# Check all pods across namespaces
+oc get pods --all-namespaces
+
+# Check ArgoCD sync status
+argocd app list
+argocd app get production-app
+
+# Check Velero backups
+velero backup get
+
+# Check ROSA cluster status
+rosa describe cluster --cluster ocp4-prod
+
+# Scale worker nodes manually
+rosa edit machinepool --cluster ocp4-prod --replicas 5 workers
+
+# View logs of a pod
+oc logs -f <pod-name> -n production
+
+# Rollback a deployment
+oc rollout undo deployment/my-app -n production
+
+# Delete ROSA cluster (when no longer needed)
+rosa delete cluster --cluster ocp4-prod --yes
+
+
+================================================================
+QUICK TROUBLESHOOTING
+================================================================
+
+# Pod is CrashLooping?
+oc describe pod <pod-name> -n production
+oc logs <pod-name> -n production --previous
+
+# Velero backup failed?
+velero backup describe <backup-name>
+velero backup logs <backup-name>
+
+# Velero restore failed?
+velero restore describe <restore-name>
+velero restore logs <restore-name>
+
+# Terraform error?
+terraform plan          # see what changed
+terraform state list    # see what terraform knows about
+terraform destroy       # nuclear option — destroys everything
+
+# ArgoCD out of sync?
+argocd app sync production-app --force
+argocd app get production-app
+
+# Cannot pull image from ECR?
+aws ecr get-login-password --region ap-south-1 | \
+  docker login --username AWS \
+  --password-stdin 123456789.dkr.ecr.ap-south-1.amazonaws.com
+
+================================================================
+END OF COMMANDS
+================================================================

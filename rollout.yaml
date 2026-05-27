@@ -1,0 +1,71 @@
+{{/* ============================================================
+   Helm Template: Argo Rollouts — Blue-Green Strategy
+   File: helm/my-app/templates/rollout.yaml
+   Replaces: standard Kubernetes Deployment
+   Purpose: Enables Blue-Green zero-downtime deployment
+   ============================================================ */}}
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ .Values.appName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.appName }}
+    version: {{ .Values.image.tag }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ .Values.appName }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.appName }}
+    spec:
+      containers:
+        - name: {{ .Values.appName }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: {{ .Values.containerPort }}
+          # Health check — Argo Rollouts uses this to verify GREEN is healthy
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.containerPort }}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.containerPort }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+
+  # ---- BLUE-GREEN STRATEGY CONFIGURATION ----
+  strategy:
+    blueGreen:
+      # activeService → gets 100% LIVE traffic (BLUE)
+      activeService: {{ .Values.appName }}-active
+
+      # previewService → gets 0% traffic (GREEN — for testing only)
+      previewService: {{ .Values.appName }}-preview
+
+      # autoPromotionEnabled: false → pipeline manually promotes
+      # We test GREEN first, THEN promote (our pipeline does this in Job 5)
+      autoPromotionEnabled: false
+
+      # Keep old BLUE pods running for 5 minutes after promotion
+      # Allows instant rollback if issues found post-promotion
+      scaleDownDelaySeconds: 300
+
+      # How long to wait before giving up on GREEN becoming healthy
+      progressDeadlineSeconds: 600

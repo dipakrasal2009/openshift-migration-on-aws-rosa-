@@ -1,0 +1,27 @@
+# ============================================================
+# Helm Values — Production Environment
+# File: helm/my-app/values-production.yaml
+# Updated by GitHub Actions pipeline automatically (image tag)
+# ============================================================
+
+appName: my-app
+namespace: production
+baseDomain: ocp4-prod.example.com   # change to your actual domain
+
+# Image — tag is auto-updated by CI/CD pipeline
+image:
+  repository: 123456789.dkr.ecr.ap-south-1.amazonaws.com/my-app
+  tag: "latest"   # pipeline replaces this with git SHA on every deploy
+
+# Number of pods for EACH environment (BLUE and GREEN each get this many)
+replicaCount: 3
+
+containerPort: 8080
+
+resources:
+  requests:
+    cpu: "250m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"

@@ -1,0 +1,51 @@
+{{/* ============================================================
+   Helm Template: OpenShift Routes for Blue-Green
+   File: helm/my-app/templates/routes.yaml
+
+   TWO routes required:
+   1. active  → public URL users visit (points to BLUE service)
+   2. preview → internal URL pipeline uses to test GREEN
+   ============================================================ */}}
+
+# ---- ROUTE 1: ACTIVE — Public URL (BLUE / Live Traffic) ----
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ .Values.appName }}-active
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.appName }}
+    role: active
+spec:
+  host: {{ .Values.appName }}.{{ .Values.baseDomain }}
+  to:
+    kind: Service
+    name: {{ .Values.appName }}-active    # points to BLUE service
+    weight: 100
+  port:
+    targetPort: 80
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+
+---
+# ---- ROUTE 2: PREVIEW — Internal Test URL (GREEN only) ----
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ .Values.appName }}-preview
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: {{ .Values.appName }}
+    role: preview
+spec:
+  host: {{ .Values.appName }}-preview.{{ .Values.baseDomain }}
+  to:
+    kind: Service
+    name: {{ .Values.appName }}-preview   # points to GREEN service
+    weight: 100
+  port:
+    targetPort: 80
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
